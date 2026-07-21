@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<meta name="theme-color" content="#8b8ba7" />
+<title>Tetris Boy</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<div class="gameboy">
+  <div class="top-row">
+    <div class="power-led-wrap">
+      <span class="power-led"></span>
+      <span class="power-label">POWER</span>
+    </div>
+    <div class="brand">TETRIS <span>BOY</span></div>
+  </div>
+
+  <div class="screen-bezel">
+    <div class="screen">
+      <canvas id="board" width="184" height="176"></canvas>
+      <div id="overlay" class="overlay hidden">
+        <div class="overlay-title" id="overlay-title">PAUSED</div>
+        <div class="overlay-sub" id="overlay-sub"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="brand-sub">DOT MATRIX WITH STEREO SOUND</div>
+
+  <div class="controls">
+    <div class="dpad-wrap">
+      <div class="dpad">
+        <button class="dpad-btn dpad-up" data-action="hardDrop" aria-label="Hard Drop">▲</button>
+        <button class="dpad-btn dpad-left" data-action="left" aria-label="Move Left">◀</button>
+        <div class="dpad-center"></div>
+        <button class="dpad-btn dpad-right" data-action="right" aria-label="Move Right">▶</button>
+        <button class="dpad-btn dpad-down" data-action="down" aria-label="Soft Drop">▼</button>
+      </div>
+    </div>
+
+    <div class="ab-wrap">
+      <button class="ab-btn btn-b" data-action="rotateCCW" aria-label="Rotate Left">B</button>
+      <button class="ab-btn btn-a" data-action="rotateCW" aria-label="Rotate Right">A</button>
+    </div>
+  </div>
+
+  <div class="meta-row">
+    <button class="pill-btn" data-action="select" aria-label="Restart">SELECT</button>
+    <button class="pill-btn" data-action="start" aria-label="Pause">START</button>
+    <button class="pill-btn mute-btn" id="mute-btn" aria-label="Mute">🔊</button>
+  </div>
+
+  <div class="speaker-lines" aria-hidden="true">
+    <span></span><span></span><span></span><span></span><span></span><span></span>
+  </div>
+</div>
+
+<script src="game.js"></script>
+</body>
+</html>
