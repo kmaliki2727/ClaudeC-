@@ -33,6 +33,8 @@ import urllib.parse as urlparse
 
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 try:
     from bs4 import BeautifulSoup
@@ -41,15 +43,17 @@ except ImportError:
     HAVE_BS4 = False  # falls back to regex link-finding
 
 # ---------------------------------------------------------------- config
-EXCEL_FILE   = "Research mapping.xlsx"
-SHEET_NAME   = "Research institutions mapped to"
-LINK_COL     = "Link"
-INDEX_COL    = "Number"
-OUT_DIR      = "downloaded_pdfs"
-REPORT_CSV   = "download_report.csv"
-TIMEOUT      = 30          # seconds per request
-PAUSE        = 1.0         # polite delay between rows (seconds)
-MAX_HTML_MB  = 15          # don't scan HTML pages larger than this
+EXCEL_FILE      = "Research mapping.xlsx"
+SHEET_NAME      = "Research institutions mapped to"
+LINK_COL        = "Link"
+INDEX_COL       = "Number"
+OUT_DIR         = "downloaded_pdfs"
+REPORT_CSV      = "download_report.csv"
+TIMEOUT         = 30          # seconds per request
+PAUSE           = 1.0         # polite delay between rows (seconds)
+MAX_HTML_MB     = 15          # don't scan HTML pages larger than this
+MAX_CANDIDATES  = 4           # how many candidate PDF links to try per landing page
+MAX_RETRIES     = 3           # retries for transient network/HTTP errors
 
 HEADERS = {
     "User-Agent": (
@@ -60,39 +64,92 @@ HEADERS = {
 }
 
 
+def build_session() -> requests.Session:
+    """Session with retries on transient network/HTTP errors (timeouts, 429, 5xx)."""
+    session = requests.Session()
+    retry = Retry(
+        total=MAX_RETRIES,
+        backoff_factor=1.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
 # ---------------------------------------------------------------- helpers
 def looks_like_pdf(content: bytes) -> bool:
     """A real PDF starts with the %PDF magic bytes."""
     return content[:5] == b"%PDF-"
 
 
-def find_pdf_in_html(html: str, base_url: str):
-    """Return the most plausible absolute PDF URL found in an HTML page, or None."""
-    candidates = []
+def find_meta_refresh(html: str, base_url: str):
+    """Some publishers bounce through <meta http-equiv="refresh" content="0;url=...">."""
+    m = re.search(
+        r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+content=["\'][^"\']*url=([^"\';]+)',
+        html, flags=re.I,
+    )
+    if m:
+        return urlparse.urljoin(base_url, m.group(1).strip())
+    return None
+
+
+DOWNLOAD_WORDS = ("download", "full report", "read the report", "get the report", "pdf")
+
+
+def find_pdf_candidates(html: str, base_url: str):
+    """Return a ranked list of plausible absolute PDF URLs found in an HTML page."""
+    scored = []
 
     if HAVE_BS4:
         soup = BeautifulSoup(html, "html.parser")
-        for a in soup.find_all("a", href=True):
-            candidates.append(a["href"])
-        # Some sites expose the PDF via <meta> or data-attributes
-        for tag in soup.find_all(attrs={"data-download-url": True}):
-            candidates.append(tag["data-download-url"])
-    else:
-        candidates = re.findall(r'href=["\']([^"\']+)["\']', html, flags=re.I)
 
-    # Score candidates: prefer links ending in .pdf, then ones containing 'pdf'
-    scored = []
-    for href in candidates:
-        low = href.lower()
-        if low.endswith(".pdf"):
-            scored.append((2, href))
-        elif ".pdf" in low or "/pdf" in low or "download" in low and "pdf" in low:
-            scored.append((1, href))
+        # citation_pdf_url is the standard meta tag academic/institutional
+        # publishing platforms use to point directly at the PDF -- treat it
+        # as the strongest possible signal.
+        for meta in soup.find_all("meta", attrs={"name": re.compile("citation_pdf_url", re.I)}):
+            content = meta.get("content")
+            if content:
+                scored.append((4, content))
+
+        for tag in soup.find_all(attrs={"data-download-url": True}):
+            scored.append((3, tag["data-download-url"]))
+
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            text = a.get_text(" ", strip=True).lower()
+            low = href.lower()
+            if low.endswith(".pdf"):
+                scored.append((3, href))
+            elif ".pdf" in low or "/pdf" in low:
+                scored.append((2, href))
+            elif any(word in text for word in DOWNLOAD_WORDS):
+                # href doesn't look like a PDF, but the link text does
+                # (common for buttons like "Download full report").
+                scored.append((1, href))
+    else:
+        for href in re.findall(r'href=["\']([^"\']+)["\']', html, flags=re.I):
+            low = href.lower()
+            if low.endswith(".pdf"):
+                scored.append((3, href))
+            elif ".pdf" in low or "/pdf" in low:
+                scored.append((2, href))
+
     if not scored:
-        return None
-    scored.sort(key=lambda x: x[0], reverse=True)
-    best = scored[0][1]
-    return urlparse.urljoin(base_url, best)
+        return []
+
+    seen = set()
+    ranked = []
+    for score, href in sorted(scored, key=lambda x: x[0], reverse=True):
+        abs_url = urlparse.urljoin(base_url, href)
+        if abs_url not in seen and abs_url.lower().startswith("http"):
+            seen.add(abs_url)
+            ranked.append(abs_url)
+
+    return ranked[:MAX_CANDIDATES]
 
 
 def save_pdf(content: bytes, index: int) -> str:
@@ -102,9 +159,15 @@ def save_pdf(content: bytes, index: int) -> str:
     return path
 
 
-def fetch(url: str, session: requests.Session):
-    """GET a url, following redirects. Returns the response or raises."""
-    return session.get(url, headers=HEADERS, timeout=TIMEOUT,
+def fetch(url: str, session: requests.Session, referer: str = None):
+    """GET a url, following redirects. Returns the response or raises.
+
+    Some servers reject direct/hotlinked PDF requests unless the Referer
+    looks like it came from their own site, so callers fetching a link
+    found *inside* a page should pass that page's URL as referer.
+    """
+    headers = HEADERS if not referer else {**HEADERS, "Referer": referer}
+    return session.get(url, headers=headers, timeout=TIMEOUT,
                        allow_redirects=True, stream=True)
 
 
@@ -148,17 +211,35 @@ def process_row(index: int, url: str, session: requests.Session):
     except Exception:
         return ("MANUAL", "", "could not decode page")
 
-    pdf_url = find_pdf_in_html(html, resp.url)
-    if not pdf_url:
+    # Some publishers bounce the landing page through a meta-refresh before
+    # the real content loads -- follow one hop of that before scanning.
+    refresh_url = find_meta_refresh(html, resp.url)
+    if refresh_url:
+        try:
+            resp2 = fetch(refresh_url, session, referer=resp.url)
+            if looks_like_pdf(resp2.content):
+                return ("OK", save_pdf(resp2.content, index), "direct PDF (via meta-refresh)")
+            html = resp2.content.decode("utf-8", errors="ignore")
+            resp = resp2
+        except Exception:
+            pass  # fall through and try scanning the original page anyway
+
+    candidates = find_pdf_candidates(html, resp.url)
+    if not candidates:
         return ("MANUAL", "", "no PDF link found on landing page (grab by hand)")
 
-    try:
-        r2 = fetch(pdf_url, session)
-        if r2.status_code == 200 and looks_like_pdf(r2.content):
-            return ("OK", save_pdf(r2.content, index), f"found PDF at {pdf_url}")
-        return ("MANUAL", "", f"candidate link was not a PDF: {pdf_url}")
-    except Exception as e:
-        return ("MANUAL", "", f"error fetching found PDF link: {e}")
+    errors = []
+    for pdf_url in candidates:
+        try:
+            r2 = fetch(pdf_url, session, referer=resp.url)
+            if r2.status_code == 200 and looks_like_pdf(r2.content):
+                return ("OK", save_pdf(r2.content, index), f"found PDF at {pdf_url}")
+            errors.append(f"{pdf_url} -> HTTP {r2.status_code}, not a PDF")
+        except Exception as e:
+            errors.append(f"{pdf_url} -> {type(e).__name__}: {e}")
+
+    return ("MANUAL", "", f"tried {len(candidates)} candidate link(s), none were a PDF: "
+                           + "; ".join(errors))
 
 
 def main():
@@ -166,7 +247,7 @@ def main():
     df = pd.read_excel(EXCEL_FILE, sheet_name=SHEET_NAME)
     df = df[[INDEX_COL, LINK_COL]].dropna(subset=[INDEX_COL, LINK_COL])
 
-    session = requests.Session()
+    session = build_session()
     rows = []
     total = len(df)
     for i, (_, row) in enumerate(df.iterrows(), 1):
